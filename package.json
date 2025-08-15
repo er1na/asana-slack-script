@@ -1,0 +1,21 @@
+{
+  "name": "asana-slack-script",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Notify Slack with a single message listing all Asana tasks due on a given date (default: tomorrow).",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "send:today": "tsx src/index.ts --date today",
+    "send:tomorrow": "tsx src/index.ts --date tomorrow"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "tsx": "^4.20.4",
+    "typescript": "^5.9.2"
+  }
+}
