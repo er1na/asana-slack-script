@@ -1,0 +1,45 @@
+name: Asana → Slack daily notice
+
+on:
+  # 毎日 07:30 JST に実行（cron は UTC なので 22:30 UTC）
+  schedule:
+    - cron: '30 22 * * *'
+  # 手動実行できるように
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'JST基準で today / tomorrow / YYYY-MM-DD'
+        required: false
+        default: 'today'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ASANA_TOKEN:           ${{ secrets.ASANA_TOKEN }}
+      ASANA_WORKSPACE_GID:   ${{ secrets.ASANA_WORKSPACE_GID }}
+      ASANA_PROJECT_GIDS:    ${{ secrets.ASANA_PROJECT_GIDS }}
+      SLACK_WEBHOOK_URL:     ${{ secrets.SLACK_WEBHOOK_URL }}
+      TZ: Asia/Tokyo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Run script
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            npm run start -- --date "${{ github.event.inputs.date }}"
+          else
+            npm run start
+          fi
