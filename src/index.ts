@@ -52,7 +52,7 @@ function resolveTargetDateJST(): string {
   if (argIndex >= 0 && process.argv[argIndex + 1]) {
     const v = process.argv[argIndex + 1];
     if (v === 'today') return jst.toISOString().slice(0, 10);
-    if (v === 'tomorrow') { jst.setDate(jst.getDate() + 1); return jst.toISOString().slice(0, 10); }
+    if (v === 'tomorrow') { jst.setDate(jst.getDate() + 1); return jst.toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' }); }
     return v;
   }
   if (envOverride) return envOverride;
