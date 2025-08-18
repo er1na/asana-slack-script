@@ -41,5 +41,5 @@ jobs:
           if [ -n "${{ github.event.inputs.date }}" ]; then
             npm run start -- --date "${{ github.event.inputs.date }}"
           else
-            npm run start
+            npm run start -- --date today
           fi
