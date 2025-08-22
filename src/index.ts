@@ -4,6 +4,8 @@ type Task = {
   gid: string;
   name: string;
   due_on?: string;
+  due_at?: string;
+  start_on?: string;
   permalink_url?: string;
   projects?: { name: string }[];
   custom_fields?: Array<{
@@ -15,7 +17,10 @@ type Task = {
 
 const ASANA_TOKEN = process.env.ASANA_TOKEN!;
 const WORKSPACE = process.env.ASANA_WORKSPACE_GID!;
-const PROJECTS = (process.env.ASANA_PROJECT_GIDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const PROJECTS = (process.env.ASANA_PROJECT_GIDS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 const ASSIGNEE = process.env.ASANA_ASSIGNEE_GID || '';
 const WEBHOOK = process.env.SLACK_WEBHOOK_URL || '';
 const BOT_TOKEN = process.env.SLACK_BOT_TOKEN || '';
@@ -30,85 +35,118 @@ if (!WORKSPACE) {
   process.exit(1);
 }
 if (!WEBHOOK && !(BOT_TOKEN && CHANNEL)) {
-  console.error('Slack 送信先が未設定です');
+  console.error('Slack 送信先が未設定です（WEBHOOK か BOT_TOKEN+CHANNEL のどちらか）');
   process.exit(1);
 }
+
+/** ----- JST日付ユーティリティ（環境非依存） ----- **/
+
+// JSTのYYYY-MM-DDを作る（Intl非依存。先に+9hしてからISO先頭10桁）
+function ymdJSTFromNow(offsetDays = 0): string {
+  const nowUtc = Date.now();
+  const jstMs = nowUtc + 9 * 60 * 60 * 1000 + offsetDays * 24 * 60 * 60 * 1000;
+  return new Date(jstMs).toISOString().slice(0, 10);
+}
+
+// JSTの「その日全体」をUTCで表したISOレンジ（due_at用）
+function jstDayToUtcRange(yyyyMmDd: string) {
+  const [y, m, d] = yyyyMmDd.split('-').map(Number);
+  // JST 00:00 は UTC -9:00
+  const startUtc = new Date(Date.UTC(y, m - 1, d, -9, 0, 0));
+  const endUtc = new Date(Date.UTC(y, m - 1, d + 1, -9, 0, 0));
+  return { after: startUtc.toISOString(), before: endUtc.toISOString() };
+}
+
+// コマンド引数/環境変数から基準日を決定（デフォルト=JST今日）
+function resolveTargetDateJST(): string {
+  const argIndex = process.argv.indexOf('--date');
+  const envOverride = process.env.DATE_OVERRIDE;
+
+  if (argIndex >= 0 && process.argv[argIndex + 1]) {
+    const v = process.argv[argIndex + 1];
+    if (v === 'today') return ymdJSTFromNow(0);
+    if (v === 'tomorrow') return ymdJSTFromNow(1);
+    return v; // YYYY-MM-DD 直接指定
+  }
+  if (envOverride) return envOverride;
+
+  return ymdJSTFromNow(0);
+}
+
+/** ----- Asana API ----- **/
 
 async function asanaFetch(path: string, params: Record<string, string>) {
   const url = new URL(`https://app.asana.com/api/1.0${path}`);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${ASANA_TOKEN}` }
+    headers: { Authorization: `Bearer ${ASANA_TOKEN}` },
   });
   if (!res.ok) throw new Error(`Asana API error ${res.status}: ${await res.text()}`);
   return res.json();
 }
 
-function resolveTargetDateJST(): string {
-  const argIndex = process.argv.indexOf('--date');
-  const envOverride = process.env.DATE_OVERRIDE;
-  const jst = new Date(new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }));
-
-  if (argIndex >= 0 && process.argv[argIndex + 1]) {
-    const v = process.argv[argIndex + 1];
-    if (v === 'today') return jst.toISOString().slice(0, 10);
-    if (v === 'tomorrow') { jst.setDate(jst.getDate() + 1); return jst.toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo' }); }
-    return v;
-  }
-  if (envOverride) return envOverride;
-
-  return jst.toISOString().slice(0, 10);
-}
-
-async function searchTasksByDueOn(due: string): Promise<Task[]> {
-  const COMMON_FIELDS =
-  'name,assignee.name,projects.name,permalink_url,due_on,start_on,' +
+const COMMON_FIELDS =
+  'name,assignee.name,projects.name,permalink_url,due_on,due_at,start_on,' +
   'custom_fields.name,custom_fields.enum_value.name,custom_fields.display_value';
-  const params: Record<string, string> = {
-    workspace: WORKSPACE,
-    'completed': 'false',
-    'due_on': due,
+
+// 期日タスク：due_on一致 + その日中のdue_atを合算（重複排除）
+async function searchTasksByDueOn(dateJst: string): Promise<Task[]> {
+  const base: Record<string, string> = {
+    completed: 'false',
     opt_fields: COMMON_FIELDS,
-    'limit': '100'
+    limit: '100',
+    ...(ASSIGNEE ? { 'assignee.any': ASSIGNEE } : {}),
+    ...(PROJECTS.length ? { 'projects.any': PROJECTS.join(',') } : {}),
   };
-  if (ASSIGNEE) params['assignee.any'] = ASSIGNEE;
 
   const results: Task[] = [];
+  const seen = new Set<string>();
 
-  async function fetchPage(extra: Record<string, string> = {}) {
-    const data = await asanaFetch(`/workspaces/${WORKSPACE}/tasks/search`, { ...params, ...extra, ...(PROJECTS.length ? { 'projects.any': PROJECTS.join(',') } : {}) });
-    results.push(...(data.data as Task[]));
-    const next = data?.next_page?.offset;
-    if (next) {
-      await fetchPage({ offset: next });
+  async function page(path: string, params: Record<string, string>) {
+    async function fetchPage(extra: Record<string, string> = {}) {
+      const data = await asanaFetch(path, { ...params, ...extra });
+      for (const t of data.data as Task[]) {
+        if (!seen.has(t.gid)) {
+          seen.add(t.gid);
+          results.push(t);
+        }
+      }
+      const next = (data as any)?.next_page?.offset;
+      if (next) await fetchPage({ offset: next });
     }
+    await fetchPage();
   }
 
-  await fetchPage();
+  // A) due_on 完全一致
+  await page(`/workspaces/${WORKSPACE}/tasks/search`, { ...base, due_on: dateJst });
+
+  // B) due_at が JST 当日中
+  const { after, before } = jstDayToUtcRange(dateJst);
+  await page(`/workspaces/${WORKSPACE}/tasks/search`, {
+    ...base,
+    'due_at.after': after,
+    'due_at.before': before,
+  });
+
   return results;
 }
 
-async function searchTasksStartingOn(date: string): Promise<Task[]> {
-  const COMMON_FIELDS =
-  'name,assignee.name,projects.name,permalink_url,due_on,start_on,' +
-  'custom_fields.name,custom_fields.enum_value.name,custom_fields.display_value';
+// 開始タスク：start_on がその日
+async function searchTasksStartingOn(dateJst: string): Promise<Task[]> {
   const base: Record<string, string> = {
     completed: 'false',
-    'start_on.before': date,
-    'start_on.after': date,
+    // equals が無いので before/after を同日に
+    'start_on.before': dateJst,
+    'start_on.after': dateJst,
     opt_fields: COMMON_FIELDS,
     limit: '100',
+    ...(ASSIGNEE ? { 'assignee.any': ASSIGNEE } : {}),
+    ...(PROJECTS.length ? { 'projects.any': PROJECTS.join(',') } : {}),
   };
-  if (ASSIGNEE) base['assignee.any'] = ASSIGNEE;
-  if (PROJECTS.length) base['projects.any'] = PROJECTS.join(',');
 
   const results: Task[] = [];
-
   async function fetchPage(extra: Record<string, string> = {}) {
-    const data = await asanaFetch(`/workspaces/${WORKSPACE}/tasks/search`, {
-      ...base,
-      ...extra,
-    });
+    const data = await asanaFetch(`/workspaces/${WORKSPACE}/tasks/search`, { ...base, ...extra });
     results.push(...(data.data as Task[]));
     const next = (data as any)?.next_page?.offset;
     if (next) await fetchPage({ offset: next });
@@ -118,29 +156,30 @@ async function searchTasksStartingOn(date: string): Promise<Task[]> {
   return results;
 }
 
+/** ----- 表示ヘルパー ----- **/
+
+// カスタムフィールド（午前/午後）を表示。必要に応じて名前は実プロジェクトに合わせてください。
 const TARGET_FIELD_NAMES = ['午前I', '午前II', '午後I', '午後II'];
 
 function buildFieldLabels(t: Task): string {
   const cf = t.custom_fields ?? [];
   const parts = TARGET_FIELD_NAMES.map(n => {
     const f = cf.find(x => x.name === n);
-    const val =
-      f?.enum_value?.name ??
-      f?.display_value ?? '';
+    const val = f?.enum_value?.name ?? f?.display_value ?? '';
     return val ? `${n}:${val}` : '';
   }).filter(Boolean);
   return parts.length ? ` [${parts.join(' / ')}]` : '';
 }
 
-function formatSlackMessage(due: string, tasks: Task[]) {
-  if (tasks.length === 0) return `【${due} 期日のタスク】なし`;
+function formatDueMessage(date: string, tasks: Task[]) {
+  if (tasks.length === 0) return `【${date} 期日のタスク】なし`;
   const lines = tasks.map(t => {
-    const projectName = t.projects?.[0]?.name ?? '（No Project）';
-    const link = t.permalink_url ? ` <${t.permalink_url}|open>` : '';
+    const proj = t.projects?.[0]?.name ?? '（No Project）';
     const labels = buildFieldLabels(t);
-    return `・${projectName} / ${t.name}${labels}${link}`;
+    const link = t.permalink_url ? ` <${t.permalink_url}|open>` : '';
+    return `・${proj} / ${t.name}${labels}${link}`;
   });
-  return [`【${due} が期日のタスク】`, ...lines].join('\n');
+  return [`【${date} が期日のタスク】`, ...lines].join('\n');
 }
 
 function formatStartMessage(date: string, tasks: Task[]) {
@@ -149,56 +188,66 @@ function formatStartMessage(date: string, tasks: Task[]) {
     .sort((a, b) => (a.projects?.[0]?.name ?? '').localeCompare(b.projects?.[0]?.name ?? '', 'ja'))
     .map(t => {
       const proj = t.projects?.[0]?.name ?? '（No Project）';
-      const link = t.permalink_url ? ` <${t.permalink_url}|open>` : '';
       const labels = buildFieldLabels(t);
+      const link = t.permalink_url ? ` <${t.permalink_url}|open>` : '';
       return `・${proj} / ${t.name}${labels}${link}`;
     });
   return [`【${date} に開始するタスク】`, ...lines].join('\n');
 }
 
+/** ----- Slack ----- **/
 
 async function postToSlack(text: string) {
-  if (process.env.SLACK_WEBHOOK_URL) {
-    const res = await fetch(process.env.SLACK_WEBHOOK_URL, {
+  if (WEBHOOK) {
+    const res = await fetch(WEBHOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'Asana',
         icon_emoji: ':ribbon:',
-        text 
-      })
+        text,
+      }),
     });
     if (!res.ok) throw new Error(`Slack webhook error ${res.status}: ${await res.text()}`);
     return;
   }
- 
+
+  // Bot token 経由
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
-      'Authorization': `Bearer ${BOT_TOKEN}`
+      Authorization: `Bearer ${BOT_TOKEN}`,
     },
-    body: JSON.stringify({ channel: CHANNEL, text })
+    body: JSON.stringify({ channel: CHANNEL, text }),
   });
   const data = await res.json();
   if (!data.ok) throw new Error(`Slack API error: ${JSON.stringify(data)}`);
 }
 
+/** ----- main ----- **/
+
 async function main() {
-  const due = resolveTargetDateJST();
-  const tasks = await searchTasksByDueOn(due);
-  const msg = formatSlackMessage(due, tasks);
-  const startTasks = await searchTasksStartingOn(due);
-  const startMsg = formatStartMessage(due, startTasks);
-  console.log('--- Due message ---\n' + msg + '\n---------------------');
+  const date = resolveTargetDateJST();
+  console.log('[DEBUG] Using JST date:', date, 'runner utc now:', new Date().toISOString());
+
+  const dueTasks = await searchTasksByDueOn(date);
+  const startTasks = await searchTasksStartingOn(date);
+
+  const dueMsg = formatDueMessage(date, dueTasks);
+  const startMsg = formatStartMessage(date, startTasks);
+
   console.log('--- Start message ---\n' + startMsg + '\n---------------------');
-  await postToSlack('\n');
+  console.log('--- Due message   ---\n' + dueMsg + '\n---------------------');
+
+  // 区切りを含めて送信（不要なら削ってOK）
   await postToSlack('────────────────');
   await postToSlack(startMsg);
-  await postToSlack('\n');
-  await postToSlack(msg);
+  await postToSlack('');
+  await postToSlack(dueMsg);
   await postToSlack('────────────────');
-  console.log('Sent to Slack:', due, `${tasks.length} tasks`);
+
+  console.log('Sent to Slack:', date, `due=${dueTasks.length}, start=${startTasks.length}`);
 }
 
 main().catch(e => {
