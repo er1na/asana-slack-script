@@ -243,7 +243,7 @@ async function main() {
   // 区切りを含めて送信（不要なら削ってOK）
   await postToSlack('────────────────');
   await postToSlack(startMsg);
-  await postToSlack('');
+  await postToSlack('\n');
   await postToSlack(dueMsg);
   await postToSlack('────────────────');
 
