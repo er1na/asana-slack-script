@@ -39,7 +39,7 @@ jobs:
       - name: Run script
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            npm run start -- --date tomorrow
+            npm run start -- --date today
           else
             if [ -n "${{ github.event.inputs.date }}" ]; then
               npm run start -- --date "${{ github.event.inputs.date }}"
