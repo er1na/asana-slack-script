@@ -39,16 +39,12 @@ if (!WEBHOOK && !(BOT_TOKEN && CHANNEL)) {
   process.exit(1);
 }
 
-/** ----- JST日付ユーティリティ（環境非依存） ----- **/
-
-// JSTのYYYY-MM-DDを作る（Intl非依存。先に+9hしてからISO先頭10桁）
 function ymdJSTFromNow(offsetDays = 0): string {
   const nowUtc = Date.now();
   const jstMs = nowUtc + 9 * 60 * 60 * 1000 + offsetDays * 24 * 60 * 60 * 1000;
   return new Date(jstMs).toISOString().slice(0, 10);
 }
 
-// JSTの「その日全体」をUTCで表したISOレンジ（due_at用）
 function jstDayToUtcRange(yyyyMmDd: string) {
   const [y, m, d] = yyyyMmDd.split('-').map(Number);
   // JST 00:00 は UTC -9:00
@@ -57,7 +53,6 @@ function jstDayToUtcRange(yyyyMmDd: string) {
   return { after: startUtc.toISOString(), before: endUtc.toISOString() };
 }
 
-// コマンド引数/環境変数から基準日を決定（デフォルト=JST今日）
 function resolveTargetDateJST(): string {
   const argIndex = process.argv.indexOf('--date');
   const envOverride = process.env.DATE_OVERRIDE;
@@ -66,14 +61,12 @@ function resolveTargetDateJST(): string {
     const v = process.argv[argIndex + 1];
     if (v === 'today') return ymdJSTFromNow(0);
     if (v === 'tomorrow') return ymdJSTFromNow(1);
-    return v; // YYYY-MM-DD 直接指定
+    return v;
   }
   if (envOverride) return envOverride;
 
   return ymdJSTFromNow(0);
 }
-
-/** ----- Asana API ----- **/
 
 async function asanaFetch(path: string, params: Record<string, string>) {
   const url = new URL(`https://app.asana.com/api/1.0${path}`);
@@ -89,7 +82,6 @@ const COMMON_FIELDS =
   'name,assignee.name,projects.name,permalink_url,due_on,due_at,start_on,' +
   'custom_fields.name,custom_fields.enum_value.name,custom_fields.display_value';
 
-// 期日タスク：due_on一致 + その日中のdue_atを合算（重複排除）
 async function searchTasksByDueOn(dateJst: string): Promise<Task[]> {
   const base: Record<string, string> = {
     completed: 'false',
@@ -117,10 +109,8 @@ async function searchTasksByDueOn(dateJst: string): Promise<Task[]> {
     await fetchPage();
   }
 
-  // A) due_on 完全一致
   await page(`/workspaces/${WORKSPACE}/tasks/search`, { ...base, due_on: dateJst });
 
-  // B) due_at が JST 当日中
   const { after, before } = jstDayToUtcRange(dateJst);
   await page(`/workspaces/${WORKSPACE}/tasks/search`, {
     ...base,
@@ -131,11 +121,10 @@ async function searchTasksByDueOn(dateJst: string): Promise<Task[]> {
   return results;
 }
 
-// 開始タスク：start_on がその日
 async function searchTasksStartingOn(dateJst: string): Promise<Task[]> {
   const base: Record<string, string> = {
     completed: 'false',
-    // equals が無いので before/after を同日に
+
     'start_on.before': dateJst,
     'start_on.after': dateJst,
     opt_fields: COMMON_FIELDS,
@@ -156,9 +145,6 @@ async function searchTasksStartingOn(dateJst: string): Promise<Task[]> {
   return results;
 }
 
-/** ----- 表示ヘルパー ----- **/
-
-// カスタムフィールド（午前/午後）を表示。必要に応じて名前は実プロジェクトに合わせてください。
 const TARGET_FIELD_NAMES = ['午前I', '午前II', '午後I', '午後II'];
 
 function buildFieldLabels(t: Task): string {
@@ -195,8 +181,6 @@ function formatStartMessage(date: string, tasks: Task[]) {
   return [`【${date} に開始するタスク】`, ...lines].join('\n');
 }
 
-/** ----- Slack ----- **/
-
 async function postToSlack(text: string) {
   if (WEBHOOK) {
     const res = await fetch(WEBHOOK, {
@@ -212,7 +196,6 @@ async function postToSlack(text: string) {
     return;
   }
 
-  // Bot token 経由
   const res = await fetch('https://slack.com/api/chat.postMessage', {
     method: 'POST',
     headers: {
@@ -224,8 +207,6 @@ async function postToSlack(text: string) {
   const data = await res.json();
   if (!data.ok) throw new Error(`Slack API error: ${JSON.stringify(data)}`);
 }
-
-/** ----- main ----- **/
 
 async function main() {
   const date = resolveTargetDateJST();
@@ -240,7 +221,6 @@ async function main() {
   console.log('--- Start message ---\n' + startMsg + '\n---------------------');
   console.log('--- Due message   ---\n' + dueMsg + '\n---------------------');
 
-  // 区切りを含めて送信（不要なら削ってOK）
   await postToSlack('────────────────');
   await postToSlack(startMsg);
   await postToSlack('\n');
