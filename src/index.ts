@@ -124,7 +124,7 @@ async function searchTasksByDueOn(dateJst: string): Promise<Task[]> {
 async function searchTasksStartingOn(dateJst: string): Promise<Task[]> {
   const base: Record<string, string> = {
     completed: 'false',
-    
+
     'start_on.before': dateJst,
     'start_on.after': dateJst,
     opt_fields: COMMON_FIELDS,
@@ -181,8 +181,6 @@ function formatStartMessage(date: string, tasks: Task[]) {
   return [`【${date} に開始するタスク】`, ...lines].join('\n');
 }
 
-/** ----- Slack ----- **/
-
 async function postToSlack(text: string) {
   if (WEBHOOK) {
     const res = await fetch(WEBHOOK, {
@@ -209,8 +207,6 @@ async function postToSlack(text: string) {
   const data = await res.json();
   if (!data.ok) throw new Error(`Slack API error: ${JSON.stringify(data)}`);
 }
-
-/** ----- main ----- **/
 
 async function main() {
   const date = resolveTargetDateJST();
